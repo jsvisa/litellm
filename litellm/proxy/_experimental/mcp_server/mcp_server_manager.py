@@ -71,7 +71,13 @@ from litellm.constants import (
     MCP_TOOL_LISTING_TIMEOUT,
 )
 from litellm.exceptions import BlockedPiiEntityError, GuardrailRaisedException
-from litellm.experimental_mcp_client.client import MCPClient, strip_auth_scheme, to_basic_credentials
+from litellm.experimental_mcp_client.client import (
+    MCPClient,
+    PersistentMCPSession,
+    UpstreamSessionClosedError,
+    strip_auth_scheme,
+    to_basic_credentials,
+)
 from litellm.integrations.custom_guardrail import (
     _sync_guardrail_info_to_logging_obj,  # pyright: ignore[reportPrivateUsage] - the same bridge @log_guardrail_information uses; reimplementing it here would fork the metadata-key logic
 )
@@ -1927,6 +1933,8 @@ class MCPServerManager:
 
         self.catalog = CatalogSnapshots(self)
         self.registry: dict[str, MCPServer] = {}
+        self._upstream_sessions: dict[tuple[str, str, str], PersistentMCPSession] = {}  # mutable-ok: session registry
+        self._live_gateway_sessions: frozenset[str] = frozenset()
         self._openapi_health_probes: Callable[[str], _OpenAPIHealthProbe] = lru_cache(maxsize=128)(_OpenAPIHealthProbe)
         self.config_mcp_servers: dict[str, MCPServer] = {}
         """
@@ -6124,6 +6132,42 @@ class MCPServerManager:
         async with semaphore:
             yield
 
+    async def _upstream_session_for(
+        self,
+        client: MCPClient,
+        mcp_server: MCPServer,
+        raw_headers: Mapping[str, str] | None,
+    ) -> PersistentMCPSession | None:
+        gateway_session_id: Final = next(
+            (
+                value
+                for key, value in (raw_headers.items() if raw_headers else ())
+                if key.lower() == "mcp-session-id" and value
+            ),
+            None,
+        )
+        if gateway_session_id not in self._live_gateway_sessions or mcp_server.transport == MCPTransport.stdio:
+            return None
+        key: Final = (gateway_session_id, mcp_server.server_id, await client.discovery_auth_fingerprint())
+        existing: Final = self._upstream_sessions.get(key)
+        if existing is not None and not existing.closed:
+            return existing
+        opened: Final = client.open_persistent_session()
+        self._upstream_sessions[key] = opened
+        return opened
+
+    def track_gateway_session(self, gateway_session_id: str) -> None:
+        self._live_gateway_sessions = self._live_gateway_sessions | frozenset((gateway_session_id,))
+
+    def release_upstream_sessions(self, gateway_session_id: str) -> None:
+        self._live_gateway_sessions = self._live_gateway_sessions - frozenset((gateway_session_id,))
+        for key in tuple(key for key in self._upstream_sessions if key[0] == gateway_session_id):
+            self._upstream_sessions.pop(key).close()
+
+    def _drop_upstream_session(self, session: PersistentMCPSession | None) -> None:
+        for key in tuple(key for key, value in self._upstream_sessions.items() if value is session):
+            self._upstream_sessions.pop(key).close()
+
     async def _obo_call_tool_with_retry(
         self,
         *,
@@ -6139,13 +6183,14 @@ class MCPServerManager:
         raw_headers: Mapping[str, str] | None = None,
         client_ip: str | None = None,
         allow_input_required: bool = False,
+        persistent_session: PersistentMCPSession | None = None,
     ) -> CallToolResult | InputRequiredResult:
         """Call a token_exchange (OBO) tool; on an upstream 401/403 re-mint the token once and retry.
 
         The exchanged token is baked into the client at build time, so the retry invalidates the
         cached exchange and rebuilds the client (which re-exchanges). One retry only: a non-auth
         failure or a second auth failure degrades to the normal ``isError`` result, and a re-exchange
-        that now fails surfaces its own 401 challenge from ``_create_mcp_client``.
+        that now fails surfaces its own 401 challenge from ``create_mcp_client``.
         """
         try:
             return await client.call_tool(
@@ -6153,13 +6198,17 @@ class MCPServerManager:
                 host_progress_callback=host_progress_callback,
                 raise_on_error=True,
                 allow_input_required=allow_input_required,
+                persistent_session=persistent_session,
             )
         except Exception as exc:
-            if _extract_upstream_auth_failure(exc) is None:
+            auth_failure: Final = _extract_upstream_auth_failure(exc)
+            if auth_failure is None and not isinstance(exc, UpstreamSessionClosedError):
                 return MCPClient.error_tool_result(exc)
-            spec: Final = to_server_spec(mcp_server)
-            if spec is not None:
-                await self._cred_provider.invalidate_credentials(to_subject(user_api_key_auth, subject_token), spec)
+            if auth_failure is not None:
+                spec: Final = to_server_spec(mcp_server)
+                if spec is not None:
+                    await self._cred_provider.invalidate_credentials(to_subject(user_api_key_auth, subject_token), spec)
+                self._drop_upstream_session(persistent_session)
             retry_client: Final = await self.create_mcp_client(
                 server=mcp_server,
                 mcp_auth_header=server_auth_header,
@@ -6174,6 +6223,7 @@ class MCPServerManager:
                 call_tool_params,
                 host_progress_callback=host_progress_callback,
                 allow_input_required=allow_input_required,
+                persistent_session=await self._upstream_session_for(retry_client, mcp_server, raw_headers),
             )
 
     async def _call_regular_mcp_tool(
@@ -6331,6 +6381,7 @@ class MCPServerManager:
             raw_headers=raw_headers,
             client_ip=client_ip,
         )
+        persistent_session: Final = await self._upstream_session_for(client, mcp_server, raw_headers)
 
         call_tool_params: Final = MCPCallToolRequestParams(
             name=original_tool_name,
@@ -6358,6 +6409,7 @@ class MCPServerManager:
                         raw_headers=raw_headers,
                         client_ip=client_ip,
                         allow_input_required=allow_input_required,
+                        persistent_session=persistent_session,
                     )
 
             tool_call_coro = _obo_call_tool_limited()
@@ -6375,6 +6427,7 @@ class MCPServerManager:
                             params,
                             host_progress_callback=host_progress_callback,
                             allow_input_required=allow_input_required,
+                            persistent_session=persistent_session,
                         )
                     # The client-forwarded modes carry the caller's own upstream token, so an upstream
                     # 401 (expired/invalid token) is the caller's to resolve: relay it as
@@ -6391,6 +6444,7 @@ class MCPServerManager:
                             host_progress_callback=host_progress_callback,
                             raise_on_error=True,
                             allow_input_required=allow_input_required,
+                            persistent_session=persistent_session,
                         )
                     except Exception as e:
                         auth_info: Final = _extract_upstream_auth_failure(e)
